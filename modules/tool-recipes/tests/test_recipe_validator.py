@@ -427,3 +427,96 @@ class TestStagedRecipeAgentAvailability:
         )
         warnings = check_agent_availability(recipe, mock_coordinator)
         assert warnings == []
+
+
+class TestStagedRecipeStepDependencies:
+    """Tests for step dependency validation in staged recipes."""
+
+    def test_staged_recipe_unknown_dependency_detected(self):
+        """Step with depends_on=['nonexistent'] should produce error containing 'nonexistent'."""
+        recipe = _staged_recipe(
+            [
+                Stage(
+                    name="stage-1",
+                    steps=[
+                        Step(
+                            id="s1",
+                            agent="a",
+                            prompt="Do something",
+                            depends_on=["nonexistent"],
+                        )
+                    ],
+                ),
+            ]
+        )
+        errors = check_step_dependencies(recipe)
+        assert len(errors) >= 1
+        assert any("nonexistent" in e for e in errors)
+
+    def test_staged_recipe_later_dependency_detected(self):
+        """Step s1 depending on later step s2 should produce error containing 'later'."""
+        recipe = _staged_recipe(
+            [
+                Stage(
+                    name="stage-1",
+                    steps=[
+                        Step(id="s1", agent="a", prompt="First", depends_on=["s2"]),
+                        Step(id="s2", agent="b", prompt="Second"),
+                    ],
+                ),
+            ]
+        )
+        errors = check_step_dependencies(recipe)
+        assert len(errors) >= 1
+        assert any("later" in e.lower() for e in errors)
+
+    def test_staged_recipe_self_dependency_detected(self):
+        """Step s1 depending on itself should produce error containing 'itself'."""
+        recipe = _staged_recipe(
+            [
+                Stage(
+                    name="stage-1",
+                    steps=[
+                        Step(id="s1", agent="a", prompt="Self", depends_on=["s1"]),
+                    ],
+                ),
+            ]
+        )
+        errors = check_step_dependencies(recipe)
+        assert len(errors) >= 1
+        assert any("itself" in e.lower() for e in errors)
+
+    def test_staged_recipe_valid_dependencies(self):
+        """Step s2 depending on earlier step s1 should have no errors."""
+        recipe = _staged_recipe(
+            [
+                Stage(
+                    name="stage-1",
+                    steps=[
+                        Step(id="s1", agent="a", prompt="First"),
+                        Step(id="s2", agent="b", prompt="Second", depends_on=["s1"]),
+                    ],
+                ),
+            ]
+        )
+        errors = check_step_dependencies(recipe)
+        assert errors == []
+
+    def test_staged_recipe_cross_stage_dependency(self):
+        """Step in stage 2 can depend on step in stage 1 (earlier in flat order), no errors."""
+        recipe = _staged_recipe(
+            [
+                Stage(
+                    name="stage-1",
+                    steps=[Step(id="s1", agent="a", prompt="First")],
+                ),
+                Stage(
+                    name="stage-2",
+                    steps=[
+                        Step(id="s2", agent="b", prompt="Second", depends_on=["s1"]),
+                    ],
+                ),
+            ]
+        )
+        errors = check_step_dependencies(recipe)
+        assert errors == []
