@@ -166,33 +166,28 @@ class TestRetryConfigGuard:
     executor must not crash on non-dict retry values.
     """
 
-    @pytest.fixture
-    def executor(self) -> RecipeExecutor:
-        """Create executor with mock dependencies."""
-        return RecipeExecutor(MockCoordinator(), MockSessionManager())  # type: ignore[arg-type]
-
-    def test_retry_string_falls_back_to_empty_dict(self, executor: RecipeExecutor):
+    def test_retry_string_falls_back_to_empty_dict(self):
         """String retry value (bypassed parse-time check) should produce {}."""
         step = Step(id="test-step")
         step.retry = "3"  # type: ignore[assignment]
         retry_config = step.retry if isinstance(step.retry, dict) else {}
         assert retry_config == {}
 
-    def test_retry_int_falls_back_to_empty_dict(self, executor: RecipeExecutor):
+    def test_retry_int_falls_back_to_empty_dict(self):
         """Int retry value (bypassed parse-time check) should produce {}."""
         step = Step(id="test-step")
         step.retry = 3  # type: ignore[assignment]
         retry_config = step.retry if isinstance(step.retry, dict) else {}
         assert retry_config == {}
 
-    def test_retry_dict_passes_through(self, executor: RecipeExecutor):
+    def test_retry_dict_passes_through(self):
         """Normal dict retry config should pass through unchanged."""
         step = Step(id="test-step")
         step.retry = {"max_attempts": 3, "backoff": "exponential"}
         retry_config = step.retry if isinstance(step.retry, dict) else {}
         assert retry_config == {"max_attempts": 3, "backoff": "exponential"}
 
-    def test_retry_none_falls_back_to_empty_dict(self, executor: RecipeExecutor):
+    def test_retry_none_falls_back_to_empty_dict(self):
         """None retry should produce {}."""
         step = Step(id="test-step")
         step.retry = None
