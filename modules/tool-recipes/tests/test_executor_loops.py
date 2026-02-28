@@ -19,6 +19,9 @@ def mock_coordinator():
     coordinator.config = {"agents": {}}
     # get_capability returns an AsyncMock that tests can configure
     coordinator.get_capability.return_value = AsyncMock()
+    # Disable hooks and cancellation so MagicMock auto-attrs don't interfere
+    coordinator.hooks = None
+    coordinator.cancellation = None
     return coordinator
 
 

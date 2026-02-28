@@ -191,6 +191,8 @@ class TestExecutorCancellation:
         coordinator.session = MagicMock()
         coordinator.config = {"agents": {}}
         coordinator.get_capability.return_value = AsyncMock(return_value="result")
+        # Disable hooks so MagicMock auto-attrs don't interfere with asyncio.create_task
+        coordinator.hooks = None
         # No cancellation token by default
         coordinator.cancellation = None
         return coordinator
@@ -341,6 +343,8 @@ class TestCoordinatorCancellationIntegration:
         coordinator.session = MagicMock()
         coordinator.config = {"agents": {}}
         coordinator.get_capability.return_value = AsyncMock(return_value="result")
+        # Disable hooks so MagicMock auto-attrs don't interfere with asyncio.create_task
+        coordinator.hooks = None
 
         # Mock cancellation token
         cancellation = MagicMock()
@@ -420,6 +424,8 @@ class TestNestedRecipeCancellation:
         coordinator.session = MagicMock()
         coordinator.config = {"agents": {}}
         coordinator.get_capability.return_value = AsyncMock(return_value="result")
+        # Disable hooks so MagicMock auto-attrs don't interfere with asyncio.create_task
+        coordinator.hooks = None
         coordinator.cancellation = None
         return coordinator
 
