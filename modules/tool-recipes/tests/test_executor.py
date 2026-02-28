@@ -164,6 +164,12 @@ class TestRetryConfigGuard:
     Defense-in-depth: even though parse-time validation catches bad retry
     values, programmatic Step construction could bypass that check. The
     executor must not crash on non-dict retry values.
+
+    NOTE: These tests replicate the ``isinstance(step.retry, dict)`` guard
+    expression inline rather than calling ``execute_step_with_retry``.  This
+    is intentional — the goal is to verify the guard *pattern* in isolation
+    without requiring async mocks of the full execution pipeline.  The
+    executor's own usage of this pattern is covered by integration tests.
     """
 
     def test_retry_string_falls_back_to_empty_dict(self):
