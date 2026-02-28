@@ -314,21 +314,29 @@ class TestValidationResult:
         assert len(result.warnings) == 1
 
 
+def _staged_recipe(stages: list[Stage], **kwargs) -> Recipe:
+    """Helper to build a staged recipe with standard test metadata."""
+    return Recipe(
+        name="staged-test",
+        description="Staged recipe test",
+        version="1.0.0",
+        stages=stages,
+        **kwargs,
+    )
+
+
 class TestStagedRecipeVariableReferences:
     """Tests for variable reference validation in staged recipes."""
 
     def test_staged_recipe_undefined_variable_detected(self):
         """Staged recipe with undefined variable should produce 1 error containing 'undefined'."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[Step(id="s1", agent="a", prompt="Use {{undefined}}")],
                 ),
-            ],
+            ]
         )
         errors = check_variable_references(recipe)
         assert len(errors) == 1
@@ -336,28 +344,22 @@ class TestStagedRecipeVariableReferences:
 
     def test_staged_recipe_valid_context_variable(self):
         """Staged recipe with defined context variable should have no errors."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            context={"input": "value"},
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[Step(id="s1", agent="a", prompt="Use {{input}}")],
                 ),
             ],
+            context={"input": "value"},
         )
         errors = check_variable_references(recipe)
         assert errors == []
 
     def test_staged_recipe_step_output_available_across_stages(self):
         """Step output from stage 1 should be available in stage 2."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[
@@ -373,7 +375,7 @@ class TestStagedRecipeVariableReferences:
                     name="stage-2",
                     steps=[Step(id="s2", agent="b", prompt="Use {{first_result}}")],
                 ),
-            ],
+            ]
         )
         errors = check_variable_references(recipe)
         assert errors == []
@@ -395,16 +397,13 @@ class TestStagedRecipeAgentAvailability:
 
     def test_staged_recipe_unavailable_agent_produces_warning(self):
         """Staged recipe with unavailable agent should produce warning."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[Step(id="s1", agent="unknown-agent", prompt="Do something")],
                 ),
-            ],
+            ]
         )
 
         class FakeCoordinator:
@@ -416,16 +415,13 @@ class TestStagedRecipeAgentAvailability:
 
     def test_staged_recipe_available_agent_no_warning(self):
         """Staged recipe with available agent should have no warnings."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[Step(id="s1", agent="good-agent", prompt="Do something")],
                 ),
-            ],
+            ]
         )
 
         class FakeCoordinator:
@@ -440,11 +436,8 @@ class TestStagedRecipeStepDependencies:
 
     def test_staged_recipe_unknown_dependency_detected(self):
         """Staged recipe with dependency on unknown step should produce error."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[
@@ -457,34 +450,28 @@ class TestStagedRecipeStepDependencies:
                         ),
                     ],
                 ),
-            ],
+            ]
         )
         errors = check_step_dependencies(recipe)
         assert any("nonexistent" in e for e in errors)
 
     def test_staged_recipe_self_dependency_detected(self):
         """Staged recipe with self-dependency should produce error."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[Step(id="s1", agent="a", prompt="First", depends_on=["s1"])],
                 ),
-            ],
+            ]
         )
         errors = check_step_dependencies(recipe)
         assert any("itself" in e.lower() for e in errors)
 
     def test_staged_recipe_valid_cross_stage_dependency(self):
         """Staged recipe with valid cross-stage dependency should have no errors."""
-        recipe = Recipe(
-            name="staged-test",
-            description="Staged recipe test",
-            version="1.0.0",
-            stages=[
+        recipe = _staged_recipe(
+            [
                 Stage(
                     name="stage-1",
                     steps=[Step(id="s1", agent="a", prompt="First")],
@@ -500,7 +487,7 @@ class TestStagedRecipeStepDependencies:
                         )
                     ],
                 ),
-            ],
+            ]
         )
         errors = check_step_dependencies(recipe)
         assert errors == []
