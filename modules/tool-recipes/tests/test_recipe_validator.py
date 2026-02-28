@@ -395,39 +395,37 @@ class TestStagedRecipeVariableReferences:
 class TestStagedRecipeAgentAvailability:
     """Tests for agent availability checking in staged recipes."""
 
-    def test_staged_recipe_unavailable_agent_produces_warning(self):
-        """Staged recipe with unavailable agent should produce warning."""
+    def test_staged_recipe_unavailable_agent_warned(self, mock_coordinator):
+        """Staged recipe with agent 'nonexistent-agent' should produce 1 warning containing 'nonexistent-agent'."""
         recipe = _staged_recipe(
             [
                 Stage(
                     name="stage-1",
-                    steps=[Step(id="s1", agent="unknown-agent", prompt="Do something")],
+                    steps=[
+                        Step(
+                            id="s1",
+                            agent="nonexistent-agent",
+                            prompt="Do something",
+                        )
+                    ],
                 ),
             ]
         )
-
-        class FakeCoordinator:
-            available_agents = ["other-agent"]
-
-        warnings = check_agent_availability(recipe, FakeCoordinator())
+        warnings = check_agent_availability(recipe, mock_coordinator)
         assert len(warnings) == 1
-        assert "unknown-agent" in warnings[0]
+        assert "nonexistent-agent" in warnings[0]
 
-    def test_staged_recipe_available_agent_no_warning(self):
-        """Staged recipe with available agent should have no warnings."""
+    def test_staged_recipe_available_agent_no_warning(self, mock_coordinator):
+        """Staged recipe with agent 'test-agent' should have no warnings."""
         recipe = _staged_recipe(
             [
                 Stage(
                     name="stage-1",
-                    steps=[Step(id="s1", agent="good-agent", prompt="Do something")],
+                    steps=[Step(id="s1", agent="test-agent", prompt="Do something")],
                 ),
             ]
         )
-
-        class FakeCoordinator:
-            available_agents = ["good-agent"]
-
-        warnings = check_agent_availability(recipe, FakeCoordinator())
+        warnings = check_agent_availability(recipe, mock_coordinator)
         assert warnings == []
 
 
