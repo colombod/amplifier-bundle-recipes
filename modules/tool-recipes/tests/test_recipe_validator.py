@@ -416,3 +416,301 @@ class TestRetryTypeValidation:
         )
         errors = step.validate()
         assert not any("retry" in e.lower() for e in errors)
+
+
+class TestDeeperDotPathValidation:
+    """Tests for deeper dot-path validation in check_variable_references().
+
+    When a dot-path like {{requirements.character_design}} references a context
+    dict, the validator should traverse into the dict and verify nested keys exist.
+    """
+
+    NESTED_CONTEXT = {
+        "requirements": {
+            "character_design": {"detail_level": "high"},
+            "story": "epic",
+        }
+    }
+
+    def test_valid_two_level_dot_path(self):
+        """{{requirements.character_design}} with matching context key → 0 errors."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(id="s1", agent="a", prompt="Use {{requirements.character_design}}")
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert errors == []
+
+    def test_invalid_two_level_dot_path(self):
+        """{{requirements.nonexistent}} with missing key → 1 error mentioning 'nonexistent'."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[Step(id="s1", agent="a", prompt="Use {{requirements.nonexistent}}")],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "nonexistent" in errors[0]
+
+    def test_valid_three_level_dot_path(self):
+        """{{requirements.character_design.detail_level}} 3-level → 0 errors."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    agent="a",
+                    prompt="Level: {{requirements.character_design.detail_level}}",
+                )
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert errors == []
+
+    def test_invalid_leaf_traversal(self):
+        """{{requirements.character_design.detail_level.foo}} → 1 error (leaf is not a dict)."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    agent="a",
+                    prompt="Bad: {{requirements.character_design.detail_level.foo}}",
+                )
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "detail_level" in errors[0]
+        assert "not a dict" in errors[0]
+
+    def test_step_output_prefix_skips_deeper_validation(self):
+        """{{result.some_field}} where result is a step output → 0 errors (skip deeper)."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(id="s1", agent="a", prompt="First", output="result"),
+                Step(id="s2", agent="a", prompt="Use {{result.some_field}}"),
+            ],
+        )
+        errors = check_variable_references(recipe)
+        assert errors == []
+
+    def test_reserved_namespace_skipped(self):
+        """{{recipe.name}} reserved namespace → 0 errors."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[Step(id="s1", agent="a", prompt="Name: {{recipe.name}}")],
+        )
+        errors = check_variable_references(recipe)
+        assert errors == []
+
+    def test_totally_unknown_prefix(self):
+        """{{totally_unknown.anything}} → 1 error (existing behavior)."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[Step(id="s1", agent="a", prompt="{{totally_unknown.anything}}")],
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "totally_unknown" in errors[0]
+
+    def test_simple_var_referencing_dict_context_value(self):
+        """{{requirements}} where requirements is a dict → 0 errors (simple var, valid)."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[Step(id="s1", agent="a", prompt="All reqs: {{requirements}}")],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert errors == []
+
+    def test_dot_access_on_non_dict_context_value(self):
+        """{{name.bar}} where name is a string → 1 error (not a dict)."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[Step(id="s1", agent="a", prompt="Bad: {{name.bar}}")],
+            context={"name": "hello"},
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "name" in errors[0]
+        assert "not a dict" in errors[0]
+        assert "str" in errors[0]
+
+    def test_dot_access_on_int_context_value(self):
+        """{{count.sub}} where count is an int → 1 error (not a dict)."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[Step(id="s1", agent="a", prompt="Bad: {{count.sub}}")],
+            context={"count": 42},
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "count" in errors[0]
+        assert "not a dict" in errors[0]
+        assert "int" in errors[0]
+
+    def test_deeper_validation_in_command_field(self):
+        """Deeper dot-path validation also works in command field."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    command="echo {{requirements.nonexistent}}",
+                    # Note: agent + prompt still required by Step dataclass;
+                    # check_variable_references doesn't call Step.validate().
+                    agent="a",
+                    prompt="placeholder",
+                )
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "nonexistent" in errors[0]
+
+    def test_deeper_validation_in_cwd_field(self):
+        """Deeper dot-path validation also works in cwd field."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    agent="a",
+                    prompt="go",
+                    command="ls",
+                    cwd="/tmp/{{requirements.nonexistent}}",
+                )
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "nonexistent" in errors[0]
+
+    def test_deeper_validation_in_env_field(self):
+        """Deeper dot-path validation also works in env field."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    agent="a",
+                    prompt="go",
+                    command="echo $MY_VAR",
+                    env={"MY_VAR": "{{requirements.nonexistent}}"},
+                )
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "nonexistent" in errors[0]
+
+    def test_deeper_validation_in_step_context_field(self):
+        """Deeper dot-path validation also works in step_context field."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    recipe="sub-recipe.yaml",
+                    agent="a",
+                    prompt="run",
+                    step_context={"key": "{{requirements.nonexistent}}"},
+                )
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "nonexistent" in errors[0]
+
+    def test_deeper_validation_in_recipe_path_field(self):
+        """Deeper dot-path validation also works in recipe path field."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    recipe="{{requirements.nonexistent}}/sub.yaml",
+                    agent="a",
+                    prompt="run",
+                )
+            ],
+            context=self.NESTED_CONTEXT,
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "nonexistent" in errors[0]
+
+    def test_loop_variable_dot_path_skipped(self):
+        """{{item.name}} inside a foreach loop → 0 errors (loop var, skip deeper)."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[
+                Step(
+                    id="s1",
+                    agent="a",
+                    prompt="Process {{item.name}}",
+                    foreach="{{tasks}}",
+                ),
+            ],
+            context={"tasks": [{"name": "a"}, {"name": "b"}]},
+        )
+        errors = check_variable_references(recipe)
+        assert errors == []
+
+    def test_dot_access_on_list_context_value(self):
+        """{{items.0}} where items is a list → 1 error (not a dict, shows 'list')."""
+        recipe = Recipe(
+            name="test",
+            description="test",
+            version="1.0.0",
+            steps=[Step(id="s1", agent="a", prompt="Bad: {{items.0}}")],
+            context={"items": ["a", "b"]},
+        )
+        errors = check_variable_references(recipe)
+        assert len(errors) == 1
+        assert "items" in errors[0]
+        assert "not a dict" in errors[0]
+        assert "list" in errors[0]
