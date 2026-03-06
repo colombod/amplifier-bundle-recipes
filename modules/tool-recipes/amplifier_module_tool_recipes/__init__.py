@@ -191,6 +191,21 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     auto_cleanup_days = config.get("auto_cleanup_days", 7)
     session_manager = SessionManager(base_dir, auto_cleanup_days)
 
+    # Declare observable lifecycle events for this module
+    # (hooks-logging will auto-discover and log these)
+    obs_events = list(coordinator.get_capability("observability.events") or [])
+    obs_events.extend(
+        [
+            "recipe:start",
+            "recipe:step",
+            "recipe:complete",
+            "recipe:approval",
+            "recipe:loop_iteration",
+            "recipe:loop_complete",
+        ]
+    )
+    coordinator.register_capability("observability.events", obs_events)
+
     # Initialize executor
     executor = RecipeExecutor(coordinator, session_manager)
 
