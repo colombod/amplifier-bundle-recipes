@@ -1488,6 +1488,16 @@ DO NOT return the JSON as a string or with escape characters. Return actual JSON
                 ProviderPreference(provider=step.provider, model="")
             ]
 
+        # Fallback: apply agent-level default provider_preferences if no step-level config.
+        # Mirrors tool-delegate's pattern (amplifier-foundation lines 834-841).
+        if provider_preferences is None:
+            agent_cfg = agents.get(step.agent, {})
+            agent_default_prefs = agent_cfg.get("provider_preferences", [])
+            if agent_default_prefs:
+                provider_preferences = [
+                    ProviderPreference.from_dict(p) for p in agent_default_prefs
+                ]
+
         # Build session metadata for child session tracking (navigation graph support)
         recipe_info = context.get("recipe", {})
         step_info = context.get("step", {})
