@@ -700,6 +700,47 @@ class RecipeExecutor:
                 except SkipRemainingError:
                     # Skip remaining steps
                     break
+                except ApprovalGatePausedError as e:
+                    # Child recipe step paused at an approval gate.
+                    # Mirror the approval onto the parent session so the parent
+                    # also appears paused, then re-raise with parent session_id.
+                    compound_stage = e.stage_name
+
+                    # (1) Save parent state at the current step (don't advance)
+                    state = {
+                        "session_id": session_id,
+                        "recipe_name": recipe.name,
+                        "recipe_version": recipe.version,
+                        "started": context["session"]["started"],
+                        "current_step_index": i,
+                        "context": context,
+                        "completed_steps": completed_steps,
+                        "project_path": str(project_path.resolve()),
+                        "pending_child_approval": {
+                            "child_session_id": e.session_id,
+                            "child_stage_name": e.stage_name,
+                            "parent_step_id": step.id,
+                        },
+                    }
+                    self.session_manager.save_state(session_id, project_path, state)
+
+                    # (2) Mirror the child's approval gate on the parent session
+                    self.session_manager.set_pending_approval(
+                        session_id=session_id,
+                        project_path=project_path,
+                        stage_name=compound_stage,
+                        prompt=e.approval_prompt,
+                        timeout=0,
+                        default="deny",
+                    )
+
+                    # (3) Re-raise a new APE with the parent's session_id
+                    raise ApprovalGatePausedError(
+                        session_id=session_id,
+                        stage_name=compound_stage,
+                        approval_prompt=e.approval_prompt,
+                        resume_session_id=e.session_id,
+                    ) from e
                 except CancellationRequestedError:
                     # Cancellation requested - save state and re-raise
                     raise

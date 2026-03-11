@@ -3,6 +3,7 @@
 Tests cover:
 - ApprovalGatePausedError.resume_session_id field for tracking child sessions
 - _execute_recipe_step child session management (save/resume/cleanup)
+- Flat execution loop mirrors child ApprovalGatePausedError to parent
 """
 
 import tempfile
@@ -14,6 +15,7 @@ import pytest
 from amplifier_module_tool_recipes.executor import ApprovalGatePausedError
 from amplifier_module_tool_recipes.executor import RecipeExecutor
 from amplifier_module_tool_recipes.executor import RecursionState
+from amplifier_module_tool_recipes.models import Recipe
 from amplifier_module_tool_recipes.models import Step
 
 
@@ -167,3 +169,111 @@ class TestExecuteRecipeStepChildSession:
 
             # The child's session ID should be saved in context
             assert context.get("_child_session_call-sub") == "child-paused-session"
+
+
+# =============================================================================
+# Flat Loop Approval Mirroring Tests
+# =============================================================================
+
+
+def _make_flat_recipe_with_recipe_step(tmp_path: Path, sub_recipe_path: Path) -> Path:
+    """Create a flat recipe YAML with a single recipe-type step."""
+    content = f"""\
+name: parent-recipe
+description: A parent recipe for testing approval mirroring
+version: "1.0.0"
+
+steps:
+  - id: call-sub
+    type: recipe
+    recipe: {sub_recipe_path}
+"""
+    parent_recipe_path = tmp_path / "parent.yaml"
+    parent_recipe_path.write_text(content)
+    return parent_recipe_path
+
+
+class TestFlatLoopApprovalMirroring:
+    """Tests that the flat execution loop mirrors child ApprovalGatePausedError to parent."""
+
+    @pytest.mark.asyncio
+    async def test_flat_loop_catches_child_ape_and_mirrors_approval(self):
+        """When a recipe step raises ApprovalGatePausedError, the flat loop:
+        - Saves parent state at current step index (not advanced)
+        - Calls set_pending_approval on the parent session
+        - Saves pending_child_approval metadata in state
+        - Re-raises a new APE with the parent's session_id
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sub_recipe_path = _make_sub_recipe_file(tmp_path)
+            parent_recipe_path = _make_flat_recipe_with_recipe_step(
+                tmp_path, sub_recipe_path
+            )
+
+            executor = _make_executor()
+
+            parent_session_id = "parent-session-id"
+            executor.session_manager.create_session.return_value = parent_session_id
+
+            # Track state saves so we can inspect what was saved
+            saved_states = []
+            executor.session_manager.save_state.side_effect = (
+                lambda sid, pp, state: saved_states.append(dict(state))
+            )
+
+            # Mock _execute_recipe_step to raise child APE
+            child_error = ApprovalGatePausedError(
+                session_id="child-session-id",
+                stage_name="review",
+                approval_prompt="Approve the review?",
+            )
+            executor._execute_recipe_step = AsyncMock(side_effect=child_error)
+
+            recipe = Recipe.from_yaml(parent_recipe_path)
+
+            with pytest.raises(ApprovalGatePausedError) as exc_info:
+                await executor.execute_recipe(
+                    recipe=recipe,
+                    context_vars={},
+                    project_path=tmp_path,
+                    recipe_path=parent_recipe_path,
+                )
+
+            raised_error = exc_info.value
+
+            # 1. Re-raised APE has the parent's session_id (not the child's)
+            assert raised_error.session_id == parent_session_id
+
+            # 2. Re-raised APE has the child's session_id as resume_session_id
+            assert raised_error.resume_session_id == "child-session-id"
+
+            # 3. Re-raised APE preserves the child's stage name and prompt
+            assert raised_error.stage_name == "review"
+            assert raised_error.approval_prompt == "Approve the review?"
+
+            # 4. set_pending_approval was called on the parent session
+            executor.session_manager.set_pending_approval.assert_called_once_with(
+                session_id=parent_session_id,
+                project_path=tmp_path,
+                stage_name="review",
+                prompt="Approve the review?",
+                timeout=0,
+                default="deny",
+            )
+
+            # 5. State was saved with current_step_index=0 (not advanced to 1)
+            approval_states = [
+                s for s in saved_states if "pending_child_approval" in s
+            ]
+            assert len(approval_states) >= 1, (
+                "Expected at least one save_state call with pending_child_approval"
+            )
+            approval_state = approval_states[0]
+            assert approval_state["current_step_index"] == 0
+
+            # 6. pending_child_approval metadata is saved in parent state
+            pca = approval_state["pending_child_approval"]
+            assert pca["child_session_id"] == "child-session-id"
+            assert pca["child_stage_name"] == "review"
+            assert pca["parent_step_id"] == "call-sub"
