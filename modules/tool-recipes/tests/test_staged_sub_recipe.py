@@ -17,6 +17,7 @@ from amplifier_module_tool_recipes.executor import RecipeExecutor
 from amplifier_module_tool_recipes.executor import RecursionState
 from amplifier_module_tool_recipes.models import Recipe
 from amplifier_module_tool_recipes.models import Step
+from amplifier_module_tool_recipes.session import ApprovalStatus
 
 
 # =============================================================================
@@ -218,8 +219,8 @@ class TestFlatLoopApprovalMirroring:
 
             # Track state saves so we can inspect what was saved
             saved_states = []
-            executor.session_manager.save_state.side_effect = (
-                lambda sid, pp, state: saved_states.append(dict(state))
+            executor.session_manager.save_state.side_effect = lambda sid, pp, state: (
+                saved_states.append(dict(state))
             )
 
             # Mock _execute_recipe_step to raise child APE
@@ -263,9 +264,7 @@ class TestFlatLoopApprovalMirroring:
             )
 
             # 5. State was saved with current_step_index=0 (not advanced to 1)
-            approval_states = [
-                s for s in saved_states if "pending_child_approval" in s
-            ]
+            approval_states = [s for s in saved_states if "pending_child_approval" in s]
             assert len(approval_states) >= 1, (
                 "Expected at least one save_state call with pending_child_approval"
             )
@@ -277,3 +276,117 @@ class TestFlatLoopApprovalMirroring:
             assert pca["child_session_id"] == "child-session-id"
             assert pca["child_stage_name"] == "review"
             assert pca["parent_step_id"] == "call-sub"
+
+
+# =============================================================================
+# Flat Resume With Pending Child Approval Tests
+# =============================================================================
+
+
+class TestFlatResumeWithPendingChildApproval:
+    """Tests for the flat resume path handling pending_child_approval in state."""
+
+    @pytest.mark.asyncio
+    async def test_approved_clears_pending_injects_message_removes_metadata(self):
+        """When resuming a flat recipe with pending_child_approval and APPROVED status:
+        - Pending approval is cleared
+        - _approval_message is injected into context
+        - pending_child_approval metadata is removed from state
+        - State is saved without pending_child_approval
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sub_recipe_path = _make_sub_recipe_file(tmp_path)
+            parent_recipe_path = _make_flat_recipe_with_recipe_step(
+                tmp_path, sub_recipe_path
+            )
+
+            executor = _make_executor()
+            parent_session_id = "parent-session-id"
+
+            # Initial state has pending_child_approval
+            initial_state = {
+                "session_id": parent_session_id,
+                "recipe_name": "parent-recipe",
+                "recipe_version": "1.0.0",
+                "started": "2024-01-01T00:00:00",
+                "current_step_index": 0,
+                "context": {"_child_session_call-sub": "child-session-id"},
+                "completed_steps": [],
+                "project_path": str(tmp_path.resolve()),
+                "pending_child_approval": {
+                    "child_session_id": "child-session-id",
+                    "child_stage_name": "review",
+                    "parent_step_id": "call-sub",
+                },
+            }
+
+            # State returned by second load_state (after clearing approval)
+            state_after_clear = {
+                "session_id": parent_session_id,
+                "recipe_name": "parent-recipe",
+                "recipe_version": "1.0.0",
+                "started": "2024-01-01T00:00:00",
+                "current_step_index": 0,
+                "context": {"_child_session_call-sub": "child-session-id"},
+                "completed_steps": [],
+                "project_path": str(tmp_path.resolve()),
+                "_approval_message": "approved with message",
+                "pending_child_approval": {
+                    "child_session_id": "child-session-id",
+                    "child_stage_name": "review",
+                    "parent_step_id": "call-sub",
+                },
+            }
+
+            executor.session_manager.load_state.side_effect = [
+                initial_state,  # First load during flat state loading
+                state_after_clear,  # Second load after clearing approval
+            ]
+
+            executor.session_manager.get_pending_approval.return_value = {
+                "stage_name": "review",
+                "approval_prompt": "Approve the review?",
+            }
+            executor.session_manager.get_stage_approval_status.return_value = (
+                ApprovalStatus.APPROVED
+            )
+            executor.session_manager.check_approval_timeout.return_value = None
+
+            # Track state saves
+            saved_states = []
+            executor.session_manager.save_state.side_effect = lambda sid, pp, state: (
+                saved_states.append(dict(state))
+            )
+
+            # Mock _execute_recipe_step to succeed immediately
+            executor._execute_recipe_step = AsyncMock(return_value="done")
+
+            recipe = Recipe.from_yaml(parent_recipe_path)
+
+            await executor.execute_recipe(
+                recipe=recipe,
+                context_vars={},
+                project_path=tmp_path,
+                session_id=parent_session_id,
+                recipe_path=parent_recipe_path,
+            )
+
+            # 1. clear_pending_approval was called
+            executor.session_manager.clear_pending_approval.assert_called_once_with(
+                parent_session_id, tmp_path
+            )
+
+            # 2. pending_child_approval was removed from state in a save call
+            cleanup_saves = [
+                s for s in saved_states if "pending_child_approval" not in s
+            ]
+            assert len(cleanup_saves) >= 1, (
+                "Expected at least one save_state call without pending_child_approval"
+            )
+
+            # 3. _approval_message was injected into context used during execution
+            # Verify via the context passed to _execute_recipe_step
+            call_args = executor._execute_recipe_step.call_args
+            ctx_used = call_args[0][1] if call_args[0] else call_args[1]["context"]
+            assert ctx_used.get("_approval_message") == "approved with message"

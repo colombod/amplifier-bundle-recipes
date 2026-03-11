@@ -521,6 +521,54 @@ class RecipeExecutor:
             context = state["context"]
             completed_steps = state.get("completed_steps", [])
             session_started = state["started"]
+
+            # Check if we're resuming from a pending child approval
+            if state.get("pending_child_approval"):
+                pending = self.session_manager.get_pending_approval(
+                    session_id, project_path
+                )
+                if pending:
+                    stage_name = pending["stage_name"]
+                    approval_status = self.session_manager.get_stage_approval_status(
+                        session_id, project_path, stage_name
+                    )
+
+                    # Check for timeout
+                    timeout_result = self.session_manager.check_approval_timeout(
+                        session_id, project_path
+                    )
+                    if timeout_result == ApprovalStatus.TIMEOUT:
+                        raise ValueError(
+                            f"Approval for stage '{stage_name}' timed out and was denied"
+                        )
+                    if timeout_result == ApprovalStatus.APPROVED:
+                        # Auto-approved on timeout, clear and continue
+                        self.session_manager.clear_pending_approval(
+                            session_id, project_path
+                        )
+                    elif approval_status == ApprovalStatus.PENDING:
+                        # Still pending - raise to indicate waiting
+                        raise ApprovalGatePausedError(
+                            session_id=session_id,
+                            stage_name=stage_name,
+                            approval_prompt=pending["approval_prompt"],
+                        )
+                    elif approval_status == ApprovalStatus.DENIED:
+                        raise ValueError(f"Execution denied at stage '{stage_name}'")
+                    elif approval_status == ApprovalStatus.APPROVED:
+                        # Approved - clear pending, reload state, inject approval
+                        # message, remove pending_child_approval from state, and save
+                        self.session_manager.clear_pending_approval(
+                            session_id, project_path
+                        )
+                        state = self.session_manager.load_state(
+                            session_id, project_path
+                        )
+                        context["_approval_message"] = state.get(
+                            "_approval_message", ""
+                        )
+                        state.pop("pending_child_approval", None)
+                        self.session_manager.save_state(session_id, project_path, state)
         else:
             session_id = self.session_manager.create_session(
                 recipe, project_path, recipe_path
