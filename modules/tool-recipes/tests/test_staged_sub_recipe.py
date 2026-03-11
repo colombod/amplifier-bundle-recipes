@@ -787,3 +787,63 @@ class TestApproveStageForwardsToChild:
                 project_path=tmp_path,
                 reason="No thanks",
             )
+
+
+# =============================================================================
+# Tool-Level APE Handler Reporting Tests
+# =============================================================================
+
+
+class TestToolLevelAPEReporting:
+    """Tests that tool-level APE handlers report the parent's session_id."""
+
+    @pytest.mark.asyncio
+    async def test_execute_recipe_reports_parent_session_id_on_ape(self):
+        """Tool-level APE handler in _execute_recipe reports parent's session_id.
+
+        When executor raises ApprovalGatePausedError with resume_session_id='child-sess'
+        and session_id='parent-sess', the ToolResult output['session_id'] should be
+        'parent-sess' (not 'child-sess').
+        """
+        import tempfile
+
+        tool = _make_recipes_tool()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # Create a minimal recipe file
+            recipe_content = """\
+name: test-recipe
+description: Test recipe
+version: "1.0.0"
+
+steps: []
+"""
+            recipe_file = tmp_path / "test.yaml"
+            recipe_file.write_text(recipe_content)
+
+            # Executor raises APE with parent's session_id (as re-raised by execution loops)
+            # and child's session_id in resume_session_id
+            ape = ApprovalGatePausedError(
+                session_id="parent-sess",
+                stage_name="gate",
+                approval_prompt="Approve?",
+                resume_session_id="child-sess",
+            )
+            tool.executor.execute_recipe = AsyncMock(side_effect=ape)
+
+            # Patch validate_recipe to succeed (not under test here)
+            with patch(
+                "amplifier_module_tool_recipes.validate_recipe"
+            ) as mock_validate:
+                mock_validate.return_value = MagicMock(is_valid=True)
+
+                result = await tool._execute_recipe({"recipe_path": str(recipe_file)})
+
+        # The ToolResult should report the parent's session_id (from e.session_id)
+        assert result.success is True
+        assert result.output is not None
+        assert result.output["session_id"] == "parent-sess"
+        assert result.output["status"] == "paused_for_approval"
+        assert result.output["stage_name"] == "gate"
