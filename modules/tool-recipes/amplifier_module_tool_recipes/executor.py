@@ -2266,20 +2266,32 @@ DO NOT return the JSON as a string or with escape characters. Return actual JSON
         # Create child recursion state (with step-level override if present)
         child_state = recursion_state.enter_recipe(sub_recipe.name, step.recursion)
 
+        # Check for a saved child session to resume (from a previous approval gate pause)
+        child_session_key = f"_child_session_{step.id}"
+        saved_child_session_id = context.get(child_session_key)
+
         # Execute sub-recipe recursively
         # Note: rate_limiter and orchestrator_config are inherited from parent (sub-recipes cannot override)
         # parent_session_id is passed so sub-recipes can check for cancellation
-        result = await self.execute_recipe(
-            recipe=sub_recipe,
-            context_vars=sub_context,
-            project_path=project_path,
-            session_id=None,  # Sub-recipes don't get separate session files
-            recipe_path=sub_recipe_path,
-            recursion_state=child_state,
-            rate_limiter=rate_limiter,  # Inherit parent's rate limiter
-            orchestrator_config=orchestrator_config,  # Inherit parent's orchestrator config
-            parent_session_id=parent_session_id,  # For cancellation checks
-        )
+        try:
+            result = await self.execute_recipe(
+                recipe=sub_recipe,
+                context_vars=sub_context,
+                project_path=project_path,
+                session_id=saved_child_session_id,  # Resume child session if saved, else None
+                recipe_path=sub_recipe_path,
+                recursion_state=child_state,
+                rate_limiter=rate_limiter,  # Inherit parent's rate limiter
+                orchestrator_config=orchestrator_config,  # Inherit parent's orchestrator config
+                parent_session_id=parent_session_id,  # For cancellation checks
+            )
+        except ApprovalGatePausedError as e:
+            # Save child's session ID so we can resume it on the next attempt
+            context[child_session_key] = e.session_id
+            raise
+
+        # On successful completion, clean up the saved child session key
+        context.pop(child_session_key, None)
 
         # Propagate total steps back to parent state
         recursion_state.total_steps = child_state.total_steps
