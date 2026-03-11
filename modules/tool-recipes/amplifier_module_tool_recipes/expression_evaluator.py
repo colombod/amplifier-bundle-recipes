@@ -44,7 +44,10 @@ def evaluate_condition(expression: str, context: dict[str, Any]) -> bool:
     substituted = _substitute_variables(expression, context)
 
     # Parse and evaluate the expression
-    return _evaluate_expression(substituted.strip())
+    try:
+        return _evaluate_expression(substituted.strip())
+    except ExpressionError as e:
+        raise ExpressionError(f"Invalid expression: {e}") from e
 
 
 def _escape_string_value(value: str) -> str:
@@ -417,6 +420,8 @@ class _Parser:
         """Extract and unescape string value from a token.
 
         Handles quoted strings (strips quotes and unescapes) and bare values.
+        Boolean literals (true/false) are normalized to lowercase for
+        case-insensitive comparison.
 
         Args:
             token: Raw token from tokenizer
@@ -430,6 +435,9 @@ class _Parser:
             # Strip quotes and unescape
             inner = token[1:-1]
             return _unescape_string_value(inner)
+        # Normalize boolean literals to lowercase (case-insensitive)
+        if token.lower() in ("true", "false"):
+            return token.lower()
         return token
 
     def _parse_atom(self) -> str:
