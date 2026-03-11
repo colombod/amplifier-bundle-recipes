@@ -51,10 +51,17 @@ class ApprovalGatePausedError(Exception):
     Callers should catch this and handle it appropriately (e.g., notify user).
     """
 
-    def __init__(self, session_id: str, stage_name: str, approval_prompt: str):
+    def __init__(
+        self,
+        session_id: str,
+        stage_name: str,
+        approval_prompt: str,
+        resume_session_id: str | None = None,
+    ):
         self.session_id = session_id
         self.stage_name = stage_name
         self.approval_prompt = approval_prompt
+        self.resume_session_id = resume_session_id
         super().__init__(f"Execution paused at stage '{stage_name}' awaiting approval")
 
 
