@@ -868,6 +868,7 @@ class RecipeExecutor:
             current_step_in_stage = state.get("current_step_in_stage", 0)
             completed_stages = state.get("completed_stages", [])
             completed_steps = state.get("completed_steps", [])
+            pending_child = state.get("pending_child_approval")
 
             # Check if we're resuming from a pending approval
             pending = self.session_manager.get_pending_approval(
@@ -909,6 +910,10 @@ class RecipeExecutor:
                     # Inject approval message into context for subsequent steps
                     state = self.session_manager.load_state(session_id, project_path)
                     context["_approval_message"] = state.get("_approval_message", "")
+                    # Clear pending_child_approval if it was present
+                    if pending_child:
+                        state.pop("pending_child_approval", None)
+                        self.session_manager.save_state(session_id, project_path, state)
         else:
             current_stage_index = 0
             current_step_in_stage = 0
@@ -1061,6 +1066,58 @@ class RecipeExecutor:
 
                     except SkipRemainingError:
                         break
+                    except ApprovalGatePausedError as e:
+                        # (1) Save staged state at current step (don't advance)
+                        self._save_staged_state(
+                            session_id,
+                            project_path,
+                            recipe,
+                            context,
+                            stage_idx,
+                            step_idx,
+                            completed_stages,
+                            completed_steps,
+                        )
+                        # (2) Create compound stage name
+                        compound_stage = f"{stage.name}/{e.stage_name}"
+                        # (3) Mirror approval on parent session
+                        self.session_manager.set_pending_approval(
+                            session_id=session_id,
+                            project_path=project_path,
+                            stage_name=compound_stage,
+                            prompt=e.approval_prompt,
+                            timeout=0,
+                            default="deny",
+                        )
+                        # (4) Save pending_child_approval metadata to state
+                        _pca_state = {
+                            "session_id": session_id,
+                            "recipe_name": recipe.name,
+                            "recipe_version": recipe.version,
+                            "started": context["session"]["started"],
+                            "current_stage_index": stage_idx,
+                            "current_step_in_stage": step_idx,
+                            "context": context,
+                            "completed_stages": completed_stages,
+                            "completed_steps": completed_steps,
+                            "project_path": str(project_path.resolve()),
+                            "is_staged": True,
+                            "pending_child_approval": {
+                                "child_session_id": e.session_id,
+                                "child_stage_name": e.stage_name,
+                                "parent_step_id": step.id,
+                            },
+                        }
+                        self.session_manager.save_state(
+                            session_id, project_path, _pca_state
+                        )
+                        # (5) Re-raise new APE with parent's session_id
+                        raise ApprovalGatePausedError(
+                            session_id=session_id,
+                            stage_name=compound_stage,
+                            approval_prompt=e.approval_prompt,
+                            resume_session_id=e.session_id,
+                        ) from e
                     except CancellationRequestedError:
                         # Cancellation requested - re-raise to outer handler
                         raise
