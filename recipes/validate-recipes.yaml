@@ -530,21 +530,32 @@ steps:
                       else:
                           seen_ids.add(step_id)
 
-          # 10. Duplicate output names (WARNING)
-          seen_outputs = set()
+          # 10. Duplicate output names (WARNING — unless default+override pattern)
+          # Build map: output_name -> list of steps that write to it
+          output_writers = {}  # output_name -> [step_dict, ...]
           for step in all_steps:
               if isinstance(step, dict):
                   output_name = step.get("output")
                   if output_name:
-                      if output_name in seen_outputs:
-                          findings.append({
-                              "code": "DUPLICATE_OUTPUT",
-                              "severity": "WARNING",
-                              "message": f"Duplicate output name: '{output_name}'",
-                              "detail": output_name,
-                          })
-                      else:
-                          seen_outputs.add(output_name)
+                      output_writers.setdefault(output_name, []).append(step)
+
+          for output_name, writers in output_writers.items():
+              if len(writers) > 1:
+                  # Check if this is the "default + conditional override" pattern:
+                  # one unconditional step sets a default, a conditional step overrides.
+                  # If at least one writer has a condition, it's an accepted pattern.
+                  any_conditional = any(
+                      bool(w.get("condition"))
+                      for w in writers
+                  )
+                  if not any_conditional:
+                      # All writers are unconditional — real duplicate
+                      findings.append({
+                          "code": "DUPLICATE_OUTPUT",
+                          "severity": "WARNING",
+                          "message": f"Duplicate output name: '{output_name}'",
+                          "detail": output_name,
+                      })
 
           # 11. Per-step validations
           for step in all_steps:
@@ -814,14 +825,14 @@ steps:
 
           # ── Step Design ───────────────────────────────────────────────────────
 
-          # Too many steps (> 15)
-          if len(all_steps) > 15:
+          # Too many steps (> 20)
+          if len(all_steps) > 20:
               findings.append({
                   "code": "TOO_MANY_STEPS",
-                  "severity": "WARNING",
+                  "severity": "SUGGESTION",
                   "message": (
                       f"Recipe has {len(all_steps)} steps"
-                      " — consider splitting into sub-recipes (>15 is complex)"
+                      " — consider splitting into sub-recipes (>20 is complex)"
                   ),
                   "detail": str(len(all_steps)),
               })
@@ -886,32 +897,100 @@ steps:
                           continue_outputs[output_name] = step.get("id", "")
 
           if continue_outputs:
+              # Two-pass approach: collect unguarded consumptions, then emit
+              # findings with severity adjustments for synthesis/batch patterns.
+              _consume_map = {}  # step_id -> [(output_name, source_step_id, step)]
               for step in all_steps:
                   if not isinstance(step, dict):
                       continue
                   step_id = step.get("id", "(unknown)")
                   step_condition = str(step.get("condition") or "")
+                  step_type = step.get("type", "agent")
+                  command = str(step.get("command") or "")
                   for output_name, source_step_id in continue_outputs.items():
                       if step_id == source_step_id:
                           continue  # Skip the producer itself
                       # Check if step text references this output
                       step_text = (
                           str(step.get("prompt") or "")
-                          + str(step.get("command") or "")
+                          + command
                       )
-                      if "{{" + output_name + "}}" in step_text:
-                          if not step_condition:
-                              findings.append({
-                                  "code": "UNCONDITIONAL_CONTINUE_OUTPUT",
-                                  "severity": "WARNING",
-                                  "message": (
-                                      f"Step '{step_id}' unconditionally consumes"
-                                      f" output '{output_name}' from step"
-                                      f" '{source_step_id}' (on_error: continue)"
-                                      " — add a condition guard"
-                                  ),
-                                  "detail": output_name,
-                              })
+                      if "{{" + output_name + "}}" not in step_text:
+                          continue
+                      if step_condition:
+                          continue  # Has a condition guard — OK
+                      # Enhancement 1: recognise try/except guards in Python heredocs
+                      if step_type == "bash" and (
+                          "python3 << " in command or "python3 <<" in command
+                      ):
+                          if (
+                              "try:" in command
+                              and output_name in command
+                              and "except" in command
+                          ):
+                              continue  # Safely guarded by try/except
+                      _consume_map.setdefault(step_id, []).append(
+                          (output_name, source_step_id, step)
+                      )
+
+              # Pass 2: emit findings with severity adjustments
+              for cons_step_id, consumptions in _consume_map.items():
+                  step = consumptions[0][2]
+                  step_type = step.get("type", "agent")
+                  unique_sources = {src for _, src, _ in consumptions}
+
+                  # Enhancement 3: batch consumption (>= 3 fallible sources)
+                  is_batch = len(unique_sources) >= 3
+
+                  # Enhancement 2: LLM synthesis step detection
+                  is_synthesis = False
+                  if step_type not in ("bash", "recipe") and step.get("agent"):
+                      is_last = bool(all_steps) and (step is all_steps[-1])
+                      sid = str(step.get("id") or "")
+                      if is_last or any([
+                          sid.startswith("synthesize-"),
+                          sid.endswith("-report"),
+                          sid.endswith("-summary"),
+                          sid.startswith("final-"),
+                          sid == "generate-report",
+                          re.match(r"^generate-.+-report$", sid),
+                      ]):
+                          is_synthesis = True
+
+                  for output_name, source_step_id, _ in consumptions:
+                      if is_batch or is_synthesis:
+                          if is_synthesis:
+                              msg = (
+                                  "LLM synthesis step consuming fallible"
+                                  " outputs — verify prompt handles"
+                                  " missing data gracefully."
+                              )
+                          else:
+                              msg = (
+                                  f"Step '{cons_step_id}' consumes outputs"
+                                  f" from {len(unique_sources)} fallible"
+                                  " steps (batch pattern) — verify it"
+                                  " handles missing data gracefully."
+                              )
+                          findings.append({
+                              "code": "UNCONDITIONAL_CONTINUE_OUTPUT",
+                              "severity": "SUGGESTION",
+                              "message": msg,
+                              "detail": output_name,
+                          })
+                      else:
+                          findings.append({
+                              "code": "UNCONDITIONAL_CONTINUE_OUTPUT",
+                              "severity": "WARNING",
+                              "message": (
+                                  f"Step '{cons_step_id}' unconditionally"
+                                  f" consumes output '{output_name}'"
+                                  f" from step '{source_step_id}'"
+                                  " (on_error: continue)"
+                                  " — add a condition guard"
+                              ),
+                              "detail": output_name,
+                          })
 
           # ── Prompt Design ─────────────────────────────────────────────────────
 
@@ -938,12 +1017,28 @@ steps:
                           "detail": step_id,
                       })
 
-              # Bash step without 'set -euo pipefail' and not using python3
+              # Bash step without 'set -euo pipefail' (skip for python heredocs)
               if step_type == "bash":
                   command = str(step.get("command") or "")
-                  uses_python = "python3" in command or "python " in command
+                  cmd_stripped = command.lstrip()
+                  uses_python = (
+                      cmd_stripped.startswith("python3")
+                      or cmd_stripped.startswith("python ")
+                  )
                   has_strict = "set -euo pipefail" in command
-                  if not has_strict and not uses_python:
+                  # Enhancement 4: skip trivial commands (<=2 lines or all echo)
+                  _cmd_lines = [
+                      ln for ln in command.splitlines()
+                      if ln.strip() and not ln.strip().startswith("#")
+                  ]
+                  is_trivial = (
+                      len(_cmd_lines) <= 2
+                      or all(
+                          ln.strip().startswith("echo ") or ln.strip() == "echo"
+                          for ln in _cmd_lines
+                      )
+                  )
+                  if not has_strict and not uses_python and not is_trivial:
                       findings.append({
                           "code": "NO_BASH_STRICT",
                           "severity": "SUGGESTION",
