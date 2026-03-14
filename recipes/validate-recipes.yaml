@@ -1,9 +1,15 @@
 # validate-recipes.yaml
-# Recipe Validator v1.0.0
+# Recipe Validator v1.0.1
 # Validates recipe YAML files in a bundle repository for structural correctness,
 # best practices, and semantic consistency.
 #
 # CHANGELOG:
+# v1.0.1 - Reduce false positives across three validator checks
+#        - NO_ERROR_HANDLING: only flag steps whose output feeds continue-steps
+#          or whose ID matches summary/final patterns; demote bulk count to INFO
+#        - UNCONDITIONAL_CONTINUE_OUTPUT: suppress for bash steps that deliberately
+#          check fallible output with if/[/test guards
+#        - NO_BASH_STRICT: skip for commands using || fallback operators
 # v1.0.0 - Initial release
 #        - Phase 0: Environment check (engine availability detection)
 #        - Phase 1: Recipe discovery (recursive scan + filter)
@@ -45,7 +51,7 @@ description: |
   - Deterministic quality classification with explicit PASS thresholds
   - Quick-approval path for clean repos (no unnecessary LLM analysis)
   - Configurable recipes directory and known agent patterns
-version: "1.0.0"
+version: "1.0.1"
 author: "Amplifier Recipes Collection"
 tags: ["recipes", "validation", "quality", "audit", "structure", "best-practices"]
 
@@ -870,21 +876,105 @@ steps:
                   "detail": str(len(no_timeout_steps)),
               })
 
-          # > 3 steps with no on_error handler
+          # Smart NO_ERROR_HANDLING: only flag steps where default fail
+          # is actually problematic, not every step missing on_error.
+          #
+          # Strategy:
+          # 1. Build set of step IDs that have on_error: "continue"
+          # 2. Build set of output vars consumed by those continue-steps
+          # 3. Flag a step (without explicit on_error) only if:
+          #    a) Its output feeds into a continue-step (downstream may
+          #       run with missing data if this step fails), OR
+          #    b) Its ID matches "should-be-continue" patterns (summary,
+          #       final, report, handoff, cleanup, offer, next-steps)
+          # 4. Emit an INFO note with total count of default-behavior steps
+
           no_error_handler_steps = [
               s for s in all_steps
               if isinstance(s, dict) and "on_error" not in s
           ]
-          if len(no_error_handler_steps) > 3:
+
+          # INFO note: how many steps use the default on_error (fail)
+          if no_error_handler_steps:
               findings.append({
                   "code": "NO_ERROR_HANDLING",
-                  "severity": "WARNING",
+                  "severity": "INFO",
                   "message": (
-                      f"{len(no_error_handler_steps)} steps have no on_error handler"
-                      " — add on_error to control failure behavior"
+                      f"{len(no_error_handler_steps)} steps use default"
+                      " on_error behavior (fail)"
                   ),
                   "detail": str(len(no_error_handler_steps)),
               })
+
+          # Build set of step IDs with on_error: continue
+          continue_step_ids = set()
+          for s in all_steps:
+              if isinstance(s, dict) and s.get("on_error") == "continue":
+                  sid = s.get("id")
+                  if sid:
+                      continue_step_ids.add(str(sid))
+
+          # Build set of output vars consumed by continue-steps
+          outputs_consumed_by_continue = set()
+          for s in all_steps:
+              if not isinstance(s, dict):
+                  continue
+              sid = str(s.get("id") or "")
+              if sid not in continue_step_ids:
+                  continue
+              # Scan prompt + command for template variable references
+              step_text = (
+                  str(s.get("prompt") or "")
+                  + str(s.get("command") or "")
+                  + str(s.get("condition") or "")
+              )
+              for match in re.findall(r"\{\{(\w+)", step_text):
+                  outputs_consumed_by_continue.add(match)
+
+          # Patterns for steps that should probably be continue
+          import fnmatch as _fnmatch
+          _SHOULD_BE_CONTINUE_PATTERNS = [
+              "*-summary", "final-*", "*-report",
+              "handoff", "cleanup-*", "offer-*", "next-steps",
+          ]
+
+          for s in no_error_handler_steps:
+              sid = str(s.get("id") or "")
+              output_key = str(s.get("output") or "")
+
+              # Check (a): output feeds into a continue-step
+              feeds_continue = (
+                  output_key
+                  and output_key in outputs_consumed_by_continue
+              )
+
+              # Check (b): ID matches should-be-continue patterns
+              matches_pattern = any(
+                  _fnmatch.fnmatch(sid, pat)
+                  for pat in _SHOULD_BE_CONTINUE_PATTERNS
+              )
+
+              if feeds_continue or matches_pattern:
+                  if matches_pattern:
+                      reason = (
+                          f"Step '{sid}' looks like a summary/final step"
+                          " — consider on_error: continue so"
+                          " preceding failures don't block it"
+                      )
+                  else:
+                      reason = (
+                          f"Step '{sid}' output '{output_key}' is"
+                          " consumed by a downstream step with"
+                          " on_error: continue — if this step fails,"
+                          " that downstream step may run with"
+                          " missing data"
+                      )
+                  findings.append({
+                      "code": "NO_ERROR_HANDLING",
+                      "severity": "WARNING",
+                      "message": reason,
+                      "detail": sid,
+                  })
 
           # Unconditional consumption of output from on_error: continue step
           # Build map: output_name -> producing step ID (for steps with on_error: continue)
@@ -929,6 +1019,22 @@ steps:
                               and "except" in command
                           ):
                               continue  # Safely guarded by try/except
+                      # Enhancement 5: deliberate error-handler pattern
+                      # If the consuming bash step uses if/[/test to check
+                      # the fallible output variable, it's deliberately
+                      # handling the error case — suppress the warning.
+                      if step_type == "bash" and command:
+                          _has_guard_kw = (
+                              "if " in command
+                              or "[ " in command
+                              or "test " in command
+                              or "[ -n" in command
+                              or "[ -z" in command
+                              or "test -n" in command
+                              or "test -z" in command
+                          )
+                          if _has_guard_kw and output_name in command:
+                              continue  # Deliberate error-handler
                       _consume_map.setdefault(step_id, []).append(
                           (output_name, source_step_id, step)
                       )
@@ -1038,7 +1144,11 @@ steps:
                           for ln in _cmd_lines
                       )
                   )
-                  if not has_strict and not uses_python and not is_trivial:
+                  # Enhancement 6: skip for commands with || fallback
+                  # operators — set -e would break intentional fallbacks
+                  # like: git diff || echo "Unable to diff"
+                  has_or_fallback = "||" in command
+                  if not has_strict and not uses_python and not is_trivial and not has_or_fallback:
                       findings.append({
                           "code": "NO_BASH_STRICT",
                           "severity": "SUGGESTION",
