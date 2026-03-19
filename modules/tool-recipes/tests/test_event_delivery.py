@@ -25,41 +25,47 @@ EXPECTED_RECIPE_EVENTS = [
 
 
 class TestMountRegistersObservabilityEvents:
-    """Verify mount() registers recipe events in observability.events capability."""
+    """Verify mount() contributes recipe events to observability.events."""
 
     @pytest.mark.asyncio
-    async def test_mount_registers_observability_events(self):
-        """mount() must register all recipe lifecycle events so hooks-logging discovers them."""
+    async def test_mount_contributes_observability_events(self):
+        """mount() must contribute all recipe lifecycle events via coordinator.contribute()
+        so that hook modules discover them via collect_contributions(), regardless of
+        module mount order."""
         from amplifier_module_tool_recipes import mount
 
         coordinator = MagicMock()
-        coordinator.get_capability.return_value = []
         coordinator.mount_points = {"tools": {}}
 
         await mount(coordinator, config=None)
 
-        # Verify register_capability was called with observability.events
-        coordinator.register_capability.assert_called_once_with(
+        # Verify contribute was called with observability.events and all recipe events
+        coordinator.contribute.assert_called_once_with(
             "observability.events", EXPECTED_RECIPE_EVENTS
         )
 
     @pytest.mark.asyncio
-    async def test_mount_extends_existing_observability_events(self):
-        """mount() must extend (not replace) pre-existing observability.events."""
+    async def test_mount_does_not_use_register_capability_for_events(self):
+        """mount() must not use register_capability for observability.events.
+
+        register_capability is order-dependent — if the hook module mounts before
+        the recipes module, it reads an empty list and never discovers recipe events.
+        coordinator.contribute() is the correct multi-provider pattern.
+        """
         from amplifier_module_tool_recipes import mount
 
-        existing_events = ["other:event"]
         coordinator = MagicMock()
-        coordinator.get_capability.return_value = existing_events
         coordinator.mount_points = {"tools": {}}
 
         await mount(coordinator, config=None)
 
-        # The registered list should contain both existing and new events
-        registered = coordinator.register_capability.call_args[0][1]
-        assert "other:event" in registered
-        for event in EXPECTED_RECIPE_EVENTS:
-            assert event in registered, f"Missing event: {event}"
+        # register_capability must NOT be called for observability.events
+        for call in coordinator.register_capability.call_args_list:
+            args = call[0]
+            assert args[0] != "observability.events", (
+                "mount() must use coordinator.contribute() not register_capability() "
+                "for observability.events"
+            )
 
 
 class TestShowProgressIsAsync:
