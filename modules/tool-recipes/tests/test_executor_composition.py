@@ -204,9 +204,17 @@ steps:
         executor = RecipeExecutor(mock_coordinator, mock_session_manager)
         result = await executor.execute_recipe(parent_recipe, {}, temp_dir)
 
-        # Sub-recipe should NOT have access to parent_only_var
-        # Only explicit_var should be in sub-recipe context
-        assert result["output"]["explicit_var"] == "I_was_passed"
+        # Sub-recipe's actual output key ("result") should be accessible.
+        assert result["output"]["result"] == "result"
+
+        # Input keys passed via step_context are NOT echoed back into the parent
+        # result — they are inputs to the sub-recipe, not outputs of it.
+        # (Corrected behaviour after memory-growth fix: only the output *delta* —
+        # keys the sub-recipe added — is returned, not the full sub-recipe context
+        # including the input keys that were passed in.)
+        assert "explicit_var" not in result["output"]
+
+        # Parent-only variables never leak into sub-recipe scope.
         assert "parent_only_var" not in result["output"]
         assert "another_parent_var" not in result["output"]
 
@@ -214,7 +222,7 @@ steps:
     async def test_output_contains_sub_context(
         self, mock_coordinator, mock_session_manager, temp_dir
     ):
-        """Step output contains entire sub-recipe's final context."""
+        """Step output contains the sub-recipe's output delta (keys added during execution)."""
         mock_spawn = mock_coordinator.get_capability.return_value
         mock_spawn.side_effect = ["res1", "res2", "res3"]
 

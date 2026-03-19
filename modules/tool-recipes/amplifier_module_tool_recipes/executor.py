@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import gc
 import json
 import logging
 import os
@@ -26,6 +27,19 @@ from .models import RecursionConfig
 from .models import Step
 from .session import ApprovalStatus
 from .session import SessionManager
+
+# Keys injected by execute_recipe() itself into every sub-recipe context.
+# These are never meaningful "outputs" from a sub-recipe — they are infrastructure
+# metadata that the parent recipe already has (or doesn't need).
+_RECIPE_INTERNAL_KEYS: frozenset[str] = frozenset(
+    {"recipe", "session", "step", "stage", "_skipped_steps"}
+)
+
+# Checkpoint trimming: values serialised larger than this threshold (bytes) are
+# replaced with a human-readable placeholder in the on-disk checkpoint file.
+# The *live* context is never modified — only the serialised copy is trimmed.
+# 100 KB per value is generous for typical recipe outputs.
+_CHECKPOINT_TRIM_THRESHOLD_BYTES: int = 100_000
 
 
 @dataclass
@@ -678,7 +692,7 @@ class RecipeExecutor:
                             "recipe_version": recipe.version,
                             "started": context["session"]["started"],
                             "current_step_index": i + 1,
-                            "context": context,
+                            "context": self._trim_context_for_checkpoint(context),
                             "completed_steps": completed_steps,
                             "project_path": str(project_path.resolve()),
                         }
@@ -737,7 +751,7 @@ class RecipeExecutor:
                         "recipe_version": recipe.version,
                         "started": context["session"]["started"],
                         "current_step_index": i + 1,
-                        "context": context,
+                        "context": self._trim_context_for_checkpoint(context),
                         "completed_steps": completed_steps,
                         "project_path": str(project_path.resolve()),
                     }
@@ -761,7 +775,7 @@ class RecipeExecutor:
                         "recipe_version": recipe.version,
                         "started": context["session"]["started"],
                         "current_step_index": i,
-                        "context": context,
+                        "context": self._trim_context_for_checkpoint(context),
                         "completed_steps": completed_steps,
                         "project_path": str(project_path.resolve()),
                         "pending_child_approval": {
@@ -1270,7 +1284,7 @@ class RecipeExecutor:
             "started": context["session"]["started"],
             "current_stage_index": stage_index,
             "current_step_in_stage": step_in_stage,
-            "context": context,
+            "context": self._trim_context_for_checkpoint(context),
             "completed_stages": completed_stages,
             "completed_steps": completed_steps,
             "project_path": str(project_path.resolve()),
@@ -1437,6 +1451,48 @@ class RecipeExecutor:
 
         # All strategies failed - return as-is
         return output
+
+    def _trim_context_for_checkpoint(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Return a checkpoint-safe copy of context with oversized values summarised.
+
+        The *live* context dict is never modified — only the serialised copy written
+        to disk is trimmed.  Any value whose JSON representation exceeds
+        ``_CHECKPOINT_TRIM_THRESHOLD_BYTES`` is replaced with a human-readable
+        placeholder string.  This keeps checkpoint files small and avoids the
+        O(n²) serialisation cost that compounds across many steps.
+
+        If a recipe needs to be *resumed* from a checkpoint that contains trimmed
+        values, those keys will be missing from the restored context.  In practice
+        Fix 1 (sub-recipe output trimming) ensures that large intermediate blobs
+        never accumulate in the first place; Fix 3 is a last-resort safety net.
+
+        Args:
+            context: The full in-memory execution context dict.
+
+        Returns:
+            A new shallow dict where large values are replaced by placeholder strings.
+        """
+        trimmed: dict[str, Any] = {}
+        for key, value in context.items():
+            try:
+                serialised = json.dumps(value, ensure_ascii=False)
+                if len(serialised) > _CHECKPOINT_TRIM_THRESHOLD_BYTES:
+                    size_kb = len(serialised) // 1024
+                    trimmed[key] = (
+                        f"[trimmed: {size_kb}KB — omitted from checkpoint to reduce serialisation pressure]"
+                    )
+                    logger.debug(
+                        "Checkpoint trim: key '%s' (%dKB) replaced with placeholder",
+                        key,
+                        size_kb,
+                    )
+                else:
+                    trimmed[key] = value
+            except (TypeError, ValueError):
+                # Value is not JSON-serialisable — keep as-is so save_state can
+                # surface the error naturally rather than silently dropping data.
+                trimmed[key] = value
+        return trimmed
 
     def _process_step_result(self, result: Any, step: Step) -> Any:
         """
@@ -1720,6 +1776,14 @@ DO NOT return the JSON as a string or with escape characters. Return actual JSON
             raise ValueError(
                 f"Step '{step.id}': agent '{step.agent}' timed out after {step.timeout}s"
             ) from None
+
+        # Give the cyclic GC a chance to reclaim PyO3 / Rust-backed objects and
+        # break reference cycles held by the completed AmplifierSession.  This is
+        # especially effective inside foreach loops where many sessions are spawned
+        # sequentially — Python's allocator won't return pages to the OS, but at
+        # least the objects are freed promptly rather than waiting for a future GC
+        # pass.
+        gc.collect()
 
         return result
 
@@ -2430,7 +2494,31 @@ DO NOT return the JSON as a string or with escape characters. Return actual JSON
         # Propagate total steps back to parent state
         recursion_state.total_steps = child_state.total_steps
 
-        return result
+        # --- Fix: trim sub-recipe return value (memory fix) ---
+        # execute_recipe() returns the *entire* sub-recipe context dict, which
+        # includes every intermediate variable from every step.  Returning that
+        # whole dict to the parent causes it to accumulate in the parent context
+        # (e.g. via step.output or foreach collect lists), leading to unbounded
+        # memory growth proportional to iterations × sub-recipe step count.
+        #
+        # Instead, return only the keys that the sub-recipe *added* — i.e. keys
+        # not present in the input (sub_context) and not injected internally by
+        # execute_recipe() itself (_RECIPE_INTERNAL_KEYS).  This is what the
+        # parent recipe actually cares about; the rest is implementation detail
+        # of the sub-recipe and should not escape its scope.
+        input_key_set = set(sub_context.keys()) | _RECIPE_INTERNAL_KEYS
+        output_delta = {
+            k: v
+            for k, v in result.items()
+            if k not in input_key_set and not k.startswith("_child_session_")
+        }
+
+        # Give the cyclic GC a chance to release PyO3 / Rust-backed objects and
+        # break reference cycles from the completed sub-recipe session before the
+        # next iteration of a foreach loop.
+        gc.collect()
+
+        return output_delta
 
     def _resolve_foreach_variable(self, foreach: str, context: dict[str, Any]) -> Any:
         """
